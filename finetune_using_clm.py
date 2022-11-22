@@ -13,6 +13,7 @@ import math
 import os
 import random
 from itertools import chain
+from typing import Any, Dict, Tuple
 
 import datasets
 import hydra
@@ -21,7 +22,7 @@ import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import Dataset, load_dataset
 from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import DataLoader
@@ -35,6 +36,17 @@ from transformers import (
 )
 
 import bittensor
+
+
+def get_base_logger() -> logging.Logger:
+
+    logger = get_logger(__name__)
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    return logger
 
 
 def check_cfg_and_load_defaults(cfg: DictConfig) -> DictConfig:
@@ -67,7 +79,7 @@ def create_accelerator(cfg: DictConfig) -> Accelerator:
     return accelerator
 
 
-def load_raw_datasets(cfg: DictConfig) -> DatasetDict:
+def load_raw_datasets(cfg: DictConfig) -> Dataset:
 
     if cfg.dataset.name == "bittensor":
 
@@ -77,7 +89,7 @@ def load_raw_datasets(cfg: DictConfig) -> DatasetDict:
             block_size=cfg.dataset.block_size,
         )
         dataloader = dataset.dataloader(cfg.dataset.num_batches)
-        bittensor_dataset = {"text": []}
+        bittensor_dataset: Dict[str, Any] = {"text": []}
         for batch in tqdm(dataloader, desc="Loading data from bittensor IPFS"):
             bittensor_dataset["text"].extend(batch)
         raw_datasets = Dataset.from_dict(bittensor_dataset)
@@ -102,7 +114,7 @@ def load_raw_datasets(cfg: DictConfig) -> DatasetDict:
     return raw_datasets
 
 
-def load_model_and_tokenizer(cfg: DictConfig):
+def load_model_and_tokenizer(cfg: DictConfig) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
 
     if cfg.model.config_name is not None:
         config = AutoConfig.from_pretrained(cfg.model.config_name)
@@ -129,7 +141,7 @@ def load_model_and_tokenizer(cfg: DictConfig):
     return tokenizer, model
 
 
-def create_optimizer(cfg, model):
+def create_optimizer(cfg: DictConfig, model) -> torch.optim.AdamW:
 
     no_decay = ["bias", "LayerNorm.weight"]
     optimizer_grouped_parameters = [
@@ -147,13 +159,15 @@ def create_optimizer(cfg, model):
     return torch.optim.AdamW(optimizer_grouped_parameters, lr=cfg.training.learning_rate)
 
 
-def preprocess(cfg, accelerator, tokenizer, raw_datasets):
+def preprocess(
+    cfg: DictConfig, accelerator: Accelerator, tokenizer: AutoTokenizer, raw_datasets: Dataset
+) -> Dataset:
 
     # First we tokenize all the texts.
     column_names = raw_datasets.column_names
     text_column_name = "text" if "text" in column_names else column_names["train"][0]
     if cfg.dataset.concatenate_raw is True:
-        pad = False
+        pad = "do_not_pad"
     else:
         pad = "max_length"
 
@@ -206,118 +220,18 @@ def preprocess(cfg, accelerator, tokenizer, raw_datasets):
     return tokenized_datasets
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
-def main(cfg: DictConfig):
-
-    cfg = check_cfg_and_load_defaults(cfg)
-    os.makedirs(cfg.output_dir, exist_ok=True)
-
-    logger = get_logger(__name__)
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
-
-    accelerator = create_accelerator(cfg)
-    accelerator.wait_for_everyone()
-
-    if cfg.training.seed is not None:
-        logger.info(f"Setting random seed to {cfg.training.seed}")
-        set_seed(cfg.training.seed)
-
-    logger.info(accelerator.state, main_process_only=False)
-    logger.info(OmegaConf.to_yaml(cfg))
-
-    tokenizer, model = load_model_and_tokenizer(cfg)
-    optimizer = create_optimizer(cfg, model)
-
-    lr_scheduler = get_scheduler(
-        name=cfg.training.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=cfg.training.lr_warmup_steps,
-        num_training_steps=cfg.training.max_train_steps,
-    )
-
-    # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
-    if accelerator.distributed_type == DistributedType.TPU:
-        model.tie_weights()
-
-    # Load and preprocess data
-    raw_datasets = load_raw_datasets(cfg)
-    tokenized_datasets = preprocess(cfg, accelerator, tokenizer, raw_datasets)
-    if "train" not in tokenized_datasets.column_names:
-        tokenized_datasets = tokenized_datasets.train_test_split(
-            test_size=cfg.training.val_split_percent / 100
-        )
-        tokenized_datasets_test_valid = tokenized_datasets["test"].train_test_split(test_size=0.5)
-        tokenized_datasets["test"] = tokenized_datasets_test_valid["train"]
-        tokenized_datasets["validation"] = tokenized_datasets_test_valid["test"]
-
-    train_dataset = tokenized_datasets["train"]
-    eval_dataset = tokenized_datasets["validation"]
-
-    # Log a few random samples from the training set:
-    for index in random.sample(range(len(train_dataset)), 3):
-        ex = train_dataset[index]
-        logger.info(f"Sample {index} of the training set: {ex}: \n")
-        logger.info(tokenizer.decode(ex["input_ids"]))
-
-    # DataLoaders creation:
-    train_dataloader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=default_data_collator,
-        batch_size=cfg.training.train_batch_size,
-    )
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        collate_fn=default_data_collator,
-        batch_size=cfg.training.eval_batch_size,
-    )
-
-    # Prepare everything using our accelerator
-    (
-        model,
-        optimizer,
-        train_dataloader,
-        eval_dataloader,
-        lr_scheduler,
-    ) = accelerator.prepare(model, optimizer, train_dataloader, eval_dataloader, lr_scheduler)
-
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / cfg.training.gradient_accumulation_steps
-    )
-    if cfg.training.max_train_steps is None:
-        cfg.training.max_train_steps = cfg.training.num_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
-
-    # We need to recalculate our total training steps as the size of the training dataloader
-    # may have changed.
-    num_update_steps_per_epoch = math.ceil(
-        len(train_dataloader) / cfg.training.gradient_accumulation_steps
-    )
-    if overrode_max_train_steps:
-        cfg.training.max_train_steps = cfg.training.num_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    cfg.training.num_epochs = math.ceil(cfg.training.max_train_steps / num_update_steps_per_epoch)
-
-    # We need to initialize the trackers we use, and also store our configuration.
-    # We initialize the trackers only on main process because `accelerator.log`
-    # only logs on main process and we don't want empty logs/runs on other processes.
-    if cfg.tracking.enabled is True and accelerator.is_main_process:
-        experiment_config = vars(cfg)
-        # TensorBoard cannot log Enums, need the raw value
-        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("finetune_using_clm", experiment_config)
-
-    logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {cfg.training.num_epochs}")
-    logger.info(f"  Gradient Accumulation steps = {cfg.training.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {cfg.training.max_train_steps}")
+def train(
+    cfg: DictConfig,
+    accelerator: Accelerator,
+    model,
+    tokenizer: AutoTokenizer,
+    optimizer: torch.optim.AdamW,
+    train_dataloader,
+    eval_dataloader,
+    eval_dataset,
+    lr_scheduler,
+    logger,
+) -> None:
 
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(
@@ -427,6 +341,127 @@ def main(cfg: DictConfig):
             )
 
         logger.info(f"done epoch {epoch}")
+
+
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg: DictConfig):
+
+    cfg = check_cfg_and_load_defaults(cfg)
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
+    logger = get_base_logger()
+    accelerator = create_accelerator(cfg)
+    accelerator.wait_for_everyone()
+
+    if cfg.training.seed is not None:
+        logger.info(f"Setting random seed to {cfg.training.seed}")
+        set_seed(cfg.training.seed)
+
+    logger.info(accelerator.state, main_process_only=False)
+    logger.info(OmegaConf.to_yaml(cfg))
+
+    tokenizer, model = load_model_and_tokenizer(cfg)
+    optimizer = create_optimizer(cfg, model)
+
+    lr_scheduler = get_scheduler(
+        name=cfg.training.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=cfg.training.lr_warmup_steps,
+        num_training_steps=cfg.training.max_train_steps,
+    )
+
+    # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
+    if accelerator.distributed_type == DistributedType.TPU:
+        model.tie_weights()
+
+    # Load and preprocess data
+    raw_datasets = load_raw_datasets(cfg)
+    tokenized_datasets = preprocess(cfg, accelerator, tokenizer, raw_datasets)
+    if "train" not in tokenized_datasets.column_names:
+        tokenized_datasets = tokenized_datasets.train_test_split(
+            test_size=cfg.training.val_split_percent / 100
+        )
+        tokenized_datasets_test_valid = tokenized_datasets["test"].train_test_split(test_size=0.5)
+        tokenized_datasets["test"] = tokenized_datasets_test_valid["train"]
+        tokenized_datasets["validation"] = tokenized_datasets_test_valid["test"]
+
+    train_dataset = tokenized_datasets["train"]
+    eval_dataset = tokenized_datasets["validation"]
+
+    # Log a few random samples from the training set:
+    for index in random.sample(range(len(train_dataset)), 3):
+        ex = train_dataset[index]
+        logger.info(f"Sample {index} of the training set: {ex}: \n")
+        logger.info(tokenizer.decode(ex["input_ids"]))
+
+    # DataLoaders creation:
+    train_dataloader = DataLoader(
+        train_dataset,
+        shuffle=True,
+        collate_fn=default_data_collator,
+        batch_size=cfg.training.train_batch_size,
+    )
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        collate_fn=default_data_collator,
+        batch_size=cfg.training.eval_batch_size,
+    )
+
+    # Prepare everything using our accelerator
+    (
+        model,
+        optimizer,
+        train_dataloader,
+        eval_dataloader,
+        lr_scheduler,
+    ) = accelerator.prepare(model, optimizer, train_dataloader, eval_dataloader, lr_scheduler)
+
+    # Scheduler and math around the number of training steps.
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / cfg.training.gradient_accumulation_steps
+    )
+    if cfg.training.max_train_steps is None:
+        cfg.training.max_train_steps = cfg.training.num_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+
+    # We need to recalculate our total training steps as the size of the training dataloader
+    # may have changed.
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / cfg.training.gradient_accumulation_steps
+    )
+    if overrode_max_train_steps:
+        cfg.training.max_train_steps = cfg.training.num_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    cfg.training.num_epochs = math.ceil(cfg.training.max_train_steps / num_update_steps_per_epoch)
+
+    # We need to initialize the trackers we use, and also store our configuration.
+    # We initialize the trackers only on main process because `accelerator.log`
+    # only logs on main process and we don't want empty logs/runs on other processes.
+    if cfg.tracking.enabled is True and accelerator.is_main_process:
+        experiment_config = vars(cfg)
+        # TensorBoard cannot log Enums, need the raw value
+        experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
+        accelerator.init_trackers("finetune_using_clm", experiment_config)
+
+    logger.info("***** Running training *****")
+    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num Epochs = {cfg.training.num_epochs}")
+    logger.info(f"  Gradient Accumulation steps = {cfg.training.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {cfg.training.max_train_steps}")
+
+    train(
+        cfg,
+        accelerator,
+        model,
+        tokenizer,
+        optimizer,
+        train_dataloader,
+        eval_dataloader,
+        eval_dataset,
+        lr_scheduler,
+        logger,
+    )
 
     if cfg.output_dir is not None:
         accelerator.wait_for_everyone()
