@@ -14,6 +14,7 @@ import os
 import random
 from itertools import chain
 from typing import Any, Dict, Tuple
+import gc
 
 import datasets
 import hydra
@@ -34,8 +35,19 @@ from transformers import (
     default_data_collator,
     get_scheduler,
 )
+from GPUtil import showUtilization as gpu_usage
 
 import bittensor
+
+
+def free_gpu_cache(logger: logging.Logger) -> None:
+
+    logger.info("Initial GPU Usage")
+    gpu_usage()
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info("GPU Usage after emptying the cache")
+    gpu_usage()
 
 
 def get_base_logger() -> logging.Logger:
@@ -260,6 +272,7 @@ def train(
             resume_step -= starting_epoch * len(train_dataloader)
 
     for epoch in range(starting_epoch, cfg.training.num_epochs):
+        free_gpu_cache(logger)
         model.train()
         if cfg.tracking.enabled is True:
             total_loss = 0
