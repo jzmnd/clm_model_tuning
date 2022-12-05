@@ -286,7 +286,9 @@ def train(
 
             outputs = model(**batch)
             loss = outputs.loss
-            train_losses.append(accelerator.gather(loss.repeat(cfg.training.train_batch_size)))
+            train_losses.append(
+                accelerator.gather(loss.repeat(cfg.training.train_batch_size).detach().clone())
+            )
             # We keep track of the loss at each epoch
             if cfg.tracking.enabled is True:
                 total_loss += loss.detach().float()
@@ -314,7 +316,7 @@ def train(
 
                     loss = outputs.loss
                     eval_losses.append(
-                        accelerator.gather(loss.repeat(cfg.training.eval_batch_size))
+                        accelerator.gather(loss.repeat(cfg.training.eval_batch_size).detach().clone())
                     )
 
                 losses = torch.cat(eval_losses)
