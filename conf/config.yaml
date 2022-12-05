@@ -48,3 +48,4 @@ training:
 tracking:
   enabled: false
   report_to: "all"
+  project_name: "finetune_using_clm"

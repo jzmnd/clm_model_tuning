@@ -456,8 +456,8 @@ def main(cfg: DictConfig):
     if cfg.tracking.enabled is True and accelerator.is_main_process:
         experiment_config = vars(cfg)
         # TensorBoard cannot log Enums, need the raw value
-        # experiment_config["lr_scheduler_type"] = experiment_config["lr_scheduler_type"].value
-        accelerator.init_trackers("finetune_using_clm", experiment_config)
+        experiment_config["lr_scheduler"] = cfg.training.lr_scheduler
+        accelerator.init_trackers(cfg.tracking.project_name, experiment_config)
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
