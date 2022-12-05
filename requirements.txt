@@ -4,3 +4,5 @@ sentencepiece!=0.1.92
 hydra-core==1.2.0
 scalecodec==1.0.48
 GPUtil
+transformers >= 4.2.0
+bittensor
